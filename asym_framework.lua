@@ -44,7 +44,9 @@ local Config = {
     FleeDistance = 45,        -- Survivor: killer closer than this -> ESCAPE
     FleeHysteresis = 10,      -- keep escaping until FleeDistance + this (avoids flicker)
     SafeDistance = 70,        -- Survivor: only REPAIR if the killer is farther than this
-    FleeStep = 30,            -- how far the flee waypoint is placed
+    FleeStep = 30,            -- base distance of flee goals (randomized 0.7x-1.5x)
+    FleeCandidates = 8,       -- random safe points sampled per flee decision
+    FleeGoalTTL = 3,          -- seconds before a flee goal is re-picked
     DodgeDistance = 14,       -- Survivor: killer closer than this and approaching -> dodge
     ApproachSpeed = 4,        -- studs/s toward me to count as "approaching"
     AbilityDistance = 20,     -- use ability when the enemy is within this distance
@@ -67,6 +69,22 @@ local Config = {
     DodgeCooldown = 0.8,
     AttackCooldown = 0.35,
     InteractCooldown = 0.4,
+
+    -- Pathfinding (PathfindingService)
+    Path = {
+        AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false,
+        WaypointSpacing = 4,
+        WaypointReach = 3,      -- flat distance to count a waypoint as reached
+        ReachDistance = 4,      -- distance to the final goal considered "arrived"
+        RepathGoalDelta = 6,    -- recompute if the goal moved more than this (chasing)
+        MinRecompute = 0.4,     -- min seconds between path computations
+        RetryDelay = 1,         -- seconds before retrying after a failed path
+        MaxPathAge = 6,         -- force a recompute after this many seconds
+        StuckTime = 2,          -- seconds without moving -> jump + new route
+        StuckDistance = 0.6,    -- studs that count as "moved"
+        StuckMinGoal = 6,       -- ignore stuck check when this close to the goal
+        FallbackDirect = true,  -- if no path exists, walk straight at the goal
+    },
 
     -- Default role detection (used by the default GetRole resolver)
     RoleKeywords = {
@@ -111,6 +129,13 @@ pcall(function() rayParams.RespectCanCollide = true end)
 function Telemetry.rayClear(from, to, ignore)
     rayParams.FilterDescendantsInstances = ignore or {}
     return Workspace:Raycast(from, to - from, rayParams) == nil
+end
+
+-- Ground position under/near `pos`, scanning down from just above refY (nil if none)
+function Telemetry.groundAt(pos, refY, ignore)
+    rayParams.FilterDescendantsInstances = ignore or {}
+    local r = Workspace:Raycast(Vector3.new(pos.X, refY + 6, pos.Z), Vector3.new(0, -40, 0), rayParams)
+    return r and r.Position or nil
 end
 
 -- Line of sight between two characters (walls between them -> false)
@@ -273,28 +298,49 @@ local function setState(name)
     if m.state ~= name then
         m.state = name
         m.since = os.clock()
+        if name ~= "ESCAPE" then m.fleeGoal = nil end
         log("state ->", name)
     end
 end
 
--- Pick a flee waypoint away from the killer that is not blocked by a wall
+-- Random safe flee GOAL (the Pathfinding module routes around walls to reach it).
+-- Samples points in the half-plane away from the killer, snaps them to the ground,
+-- and picks randomly among the 3 farthest from the killer.
 local function pickFleePoint(t, killer)
     if Config.Resolvers.GetEscapePoint then
         local ok, p = pcall(Config.Resolvers.GetEscapePoint, t, killer)
         if ok and p then return p end
     end
-    local me = t.me.position
-    local away = Vector3.new(me.X - killer.position.X, 0, me.Z - killer.position.Z)
+    local m = Decision.memory
+    local now = os.clock()
+    local me, kp = t.me.position, killer.position
+
+    -- keep the current goal while it is valid, unreachable-free and still away from the killer
+    if m.fleeGoal and not t.navFailed and now - (m.fleeSince or 0) < Config.FleeGoalTTL
+        and (m.fleeGoal - me).Magnitude > Config.Path.ReachDistance
+        and (m.fleeGoal - kp).Magnitude > (me - kp).Magnitude then
+        return m.fleeGoal
+    end
+
+    local away = Vector3.new(me.X - kp.X, 0, me.Z - kp.Z)
     if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
     away = away.Unit
-    for _, deg in ipairs({ 0, 35, -35, 70, -70, 110, -110 }) do
-        local rad = math.rad(deg)
+
+    local cands = {}
+    for _ = 1, Config.FleeCandidates do
+        local rad = math.rad(math.random(-100, 100))
         local c, s = math.cos(rad), math.sin(rad)
         local dir = Vector3.new(away.X * c - away.Z * s, 0, away.X * s + away.Z * c)
-        local target = me + dir * Config.FleeStep
-        if t.api.rayClear(me, target, { t.me.character }) then return target end
+        local dist = Config.FleeStep * (0.7 + math.random() * 0.8)
+        local g = t.api.groundAt(me + dir * dist, me.Y, { t.me.character })
+        if g then cands[#cands + 1] = { pos = g, score = (g - kp).Magnitude + math.random() * 10 } end
     end
-    return me + away * Config.FleeStep
+    table.sort(cands, function(a, b) return a.score > b.score end)
+
+    local goal = me + away * Config.FleeStep
+    if #cands > 0 then goal = cands[math.random(1, math.min(3, #cands))].pos end
+    m.fleeGoal, m.fleeSince = goal, now
+    return goal
 end
 
 local function decideSurvivor(t)
@@ -398,8 +444,71 @@ Decision.updateDecision = Decision.update -- alias with the requested name
 -- =====================================================================
 local Actions = {}
 local cooldowns = {}
-local stuck = { pos = nil, t = 0 }
 local dodgeSide = 1
+local PathService = game:GetService("PathfindingService")
+
+-- ---- Pathfinding module ---------------------------------------------
+-- Non-blocking: paths are computed in a background thread; moveTo() is called every
+-- tick and just follows the current waypoints, repathing when needed.
+local Nav = {
+    waypoints = {}, idx = 1, goal = nil,
+    computing = false, failed = false, invalid = false,
+    lastCompute = -1e9, lastCall = 0,
+    lastPos = nil, lastMoveT = 0,
+    bias = 0,        -- extra agent radius: changes the route after getting stuck
+    conn = nil,      -- Path.Blocked connection
+}
+Actions.Nav = Nav
+
+local function navReset()
+    Nav.waypoints, Nav.idx, Nav.goal = {}, 1, nil
+    Nav.failed, Nav.invalid, Nav.lastPos, Nav.bias = false, false, nil, 0
+    if Nav.conn then
+        pcall(function() Nav.conn:Disconnect() end)
+        Nav.conn = nil
+    end
+end
+Actions.resetPath = navReset
+
+local function flatDist(a, b)
+    return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+end
+
+local function computePath(goal, root)
+    if Nav.computing then return end
+    Nav.computing = true
+    Nav.goal = goal
+    Nav.lastCompute = os.clock()
+    local bias = Nav.bias
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local c = Config.Path
+            local path = PathService:CreatePath({
+                AgentRadius = c.AgentRadius + bias, AgentHeight = c.AgentHeight,
+                AgentCanJump = c.AgentCanJump, AgentCanClimb = c.AgentCanClimb,
+                WaypointSpacing = c.WaypointSpacing,
+            })
+            path:ComputeAsync(root.Position, goal)
+            if path.Status == Enum.PathStatus.Success then
+                local wps = path:GetWaypoints()
+                Nav.waypoints = wps
+                Nav.idx = (#wps > 1) and 2 or 1 -- waypoint 1 is the start position
+                Nav.failed, Nav.invalid = false, false
+                if Nav.conn then pcall(function() Nav.conn:Disconnect() end) end
+                Nav.conn = path.Blocked:Connect(function(blockedIdx)
+                    if blockedIdx >= Nav.idx then Nav.invalid = true end
+                end)
+            else
+                Nav.waypoints, Nav.failed = {}, true
+            end
+        end)
+        if not ok then
+            Nav.waypoints, Nav.failed = {}, true
+            log("path error:", err)
+        end
+        Nav.computing = false
+    end)
+end
 
 local VIM
 pcall(function() VIM = game:GetService("VirtualInputManager") end)
@@ -458,21 +567,64 @@ function Actions.click()
     end)
 end
 
-function Actions.moveTo(position, t)
-    local hum = t.me.humanoid
-    hum:MoveTo(position)
-    -- simple anti-stuck: if barely moved for 1s while far from the goal, jump
-    local now = os.clock()
-    if not stuck.pos or now - stuck.t >= 1 then
-        if stuck.pos and (t.me.position - stuck.pos).Magnitude < 0.5
-            and (position - t.me.position).Magnitude > 4 then
+-- Walk to `goal` along a PathfindingService route (called every tick).
+function Actions.moveTo(goal, t)
+    local c = Config.Path
+    local hum, root, now = t.me.humanoid, t.me.root, os.clock()
+    local pos = root.Position
+
+    -- if we were not driving the character for a while, forget the old route/stuck state
+    if now - Nav.lastCall > 1 then
+        Nav.waypoints, Nav.idx, Nav.lastPos, Nav.bias = {}, 1, nil, 0
+        Nav.goal = nil
+    end
+    Nav.lastCall = now
+
+    -- stuck detection: no real movement for StuckTime -> jump + different route
+    if not Nav.lastPos then
+        Nav.lastPos, Nav.lastMoveT = pos, now
+    elseif (pos - Nav.lastPos).Magnitude > c.StuckDistance then
+        Nav.lastPos, Nav.lastMoveT = pos, now
+    elseif now - Nav.lastMoveT >= c.StuckTime and (goal - pos).Magnitude > c.StuckMinGoal then
+        hum.Jump = true
+        Nav.bias = (Nav.bias + 1) % 4
+        Nav.invalid = true
+        Nav.lastMoveT = now
+        log("stuck -> jump + repath (bias", Nav.bias, ")")
+    end
+
+    -- (re)compute when needed
+    local needs = Nav.invalid
+        or Nav.goal == nil
+        or (Nav.goal - goal).Magnitude > c.RepathGoalDelta
+        or (Nav.failed and (Nav.goal - goal).Magnitude > 2)
+        or (#Nav.waypoints == 0 and Nav.failed and now - Nav.lastCompute > c.RetryDelay)
+        or now - Nav.lastCompute > c.MaxPathAge
+    if needs and now - Nav.lastCompute >= c.MinRecompute then
+        computePath(goal, root)
+    end
+
+    -- follow waypoints
+    local wp = Nav.waypoints[Nav.idx]
+    if wp and flatDist(wp.Position, pos) < c.WaypointReach then
+        if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+        Nav.idx = Nav.idx + 1
+        wp = Nav.waypoints[Nav.idx]
+    end
+    if wp then
+        hum:MoveTo(wp.Position)
+        if wp.Action == Enum.PathWaypointAction.Jump and flatDist(wp.Position, pos) < 4 then
             hum.Jump = true
         end
-        stuck.pos, stuck.t = t.me.position, now
+    elseif Nav.failed and not c.FallbackDirect then
+        hum:MoveTo(pos) -- no route and no fallback: stand still
+    else
+        hum:MoveTo(goal) -- final approach / route still computing / fallback
     end
 end
 
 function Actions.stop(t)
+    navReset()
     t.me.humanoid:MoveTo(t.me.position)
 end
 
@@ -572,7 +724,11 @@ end
 
 local function step()
     local t = Telemetry.snapshot()
-    if not t then return end
+    if not t then
+        navReset() -- dead/respawning: drop the old route
+        return
+    end
+    t.navFailed = Nav.failed -- lets Decision re-pick an unreachable flee goal
     local d = Decision.update(currentRole(), t)
     Framework.LastDecision = d
     Actions.execute(d, t)
@@ -626,6 +782,7 @@ function Framework.Stop()
     Framework.Enabled = false
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
     connections = {}
+    navReset()
     if gui then pcall(function() gui:Destroy() end) gui, button = nil, nil end
     env.__ASYM_FW = nil
     log("stopped")
